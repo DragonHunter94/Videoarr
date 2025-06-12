@@ -365,19 +365,41 @@ async def analyze_video_file(request: Request, file: UploadFile = File(...)):
         safe_filename = f"{timestamp}_{file.filename}"
         file_path = temp_dir / safe_filename
         
-        # Save uploaded file with chunked reading for large files
+        # Log file information
         logger.info(f"Starting upload of file: {file.filename}")
+        
+        # Save uploaded file with chunked reading for large files
+        total_size = 0
         async with aiofiles.open(file_path, 'wb') as f:
             chunk_size = 8192 * 1024  # 8MB chunks for efficient large file handling
             while True:
-                chunk = await file.read(chunk_size)
-                if not chunk:
-                    break
-                await f.write(chunk)
+                try:
+                    chunk = await file.read(chunk_size)
+                    if not chunk:
+                        break
+                    await f.write(chunk)
+                    total_size += len(chunk)
+                    
+                    # Log progress for very large files
+                    if total_size % (100 * 1024 * 1024) == 0:  # Log every 100MB
+                        logger.info(f"Upload progress: {total_size / (1024 * 1024):.1f} MB uploaded")
+                        
+                except Exception as e:
+                    logger.error(f"Error during file upload: {str(e)}")
+                    # Clean up partial file
+                    if file_path.exists():
+                        file_path.unlink()
+                    raise HTTPException(status_code=400, detail=f"Upload failed: {str(e)}")
         
-        logger.info(f"File upload completed: {file_path}, size: {file_path.stat().st_size} bytes")
+        final_size = file_path.stat().st_size
+        logger.info(f"File upload completed: {file_path}, final size: {final_size} bytes ({final_size / (1024 * 1024):.1f} MB)")
+        
+        # Verify file exists and has content
+        if not file_path.exists() or final_size == 0:
+            raise HTTPException(status_code=400, detail="File upload failed or file is empty")
         
         # Analyze video
+        logger.info(f"Starting video analysis for: {file.filename}")
         analysis_data = analyze_video_with_ffmpeg(str(file_path))
         analysis = VideoAnalysis(**analysis_data)
         
@@ -385,12 +407,15 @@ async def analyze_video_file(request: Request, file: UploadFile = File(...)):
         await db.video_analyses.insert_one(analysis.dict())
         
         # Generate Handbrake settings
+        logger.info(f"Generating Handbrake settings for: {file.filename}")
         handbrake_settings = generate_handbrake_settings(analysis)
         await db.handbrake_settings.insert_one(handbrake_settings.dict())
         
-        logger.info(f"Successfully analyzed video: {file.filename}")
+        logger.info(f"Successfully analyzed video: {file.filename}, analysis ID: {analysis.id}")
         return analysis
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in analyze_video_file: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
