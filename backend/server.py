@@ -436,6 +436,66 @@ async def run_handbrake_job(job_id: str):
 async def root():
     return {"message": "Video Optimization App API", "version": "1.0.0"}
 
+@api_router.post("/test-upload")
+async def test_upload(file: UploadFile = File(...)):
+    """Test endpoint to verify file upload without analysis - useful for debugging"""
+    try:
+        # Create temp directory
+        temp_dir = Path("/tmp/video_uploads")
+        temp_dir.mkdir(exist_ok=True)
+        
+        # Generate unique filename
+        import time
+        timestamp = int(time.time())
+        safe_filename = f"test_{timestamp}_{file.filename}"
+        file_path = temp_dir / safe_filename
+        
+        # Basic file info
+        file_info = {
+            'original_filename': file.filename,
+            'content_type': file.content_type,
+            'file_size': 0
+        }
+        
+        # Save file
+        logger.info(f"Test upload started for: {file.filename}")
+        async with aiofiles.open(file_path, 'wb') as f:
+            chunk_size = 8192 * 1024  # 8MB chunks
+            total_size = 0
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                await f.write(chunk)
+                total_size += len(chunk)
+        
+        file_info['file_size'] = total_size
+        file_info['saved_path'] = str(file_path)
+        
+        # Test FFmpeg probe on the file
+        try:
+            probe_result = ffmpeg.probe(str(file_path))
+            file_info['ffmpeg_probe'] = 'success'
+            file_info['streams_found'] = len(probe_result.get('streams', []))
+            file_info['format_detected'] = probe_result.get('format', {}).get('format_name', 'unknown')
+        except Exception as probe_error:
+            file_info['ffmpeg_probe'] = 'failed'
+            file_info['probe_error'] = str(probe_error)
+        
+        # Clean up test file
+        if file_path.exists():
+            file_path.unlink()
+        
+        logger.info(f"Test upload completed for: {file.filename}")
+        return {
+            'message': 'Test upload successful',
+            'file_info': file_info
+        }
+        
+    except Exception as e:
+        logger.error(f"Test upload failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Test upload failed: {str(e)}")
+
 @api_router.post("/analyze-video", response_model=VideoAnalysis)
 async def analyze_video_file(request: Request, file: UploadFile = File(...)):
     """Upload and analyze a video file (supports files of any size)"""
