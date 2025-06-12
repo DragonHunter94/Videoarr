@@ -400,15 +400,26 @@ function App() {
   const [selectedSettings, setSelectedSettings] = useState(null);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [systemInfo, setSystemInfo] = useState(null);
 
   useEffect(() => {
     fetchAnalyses();
     fetchJobs();
+    fetchSystemInfo();
     
     // Set up polling for job updates
     const interval = setInterval(fetchJobs, 5000);
     return () => clearInterval(interval);
   }, []);
+
+  const fetchSystemInfo = async () => {
+    try {
+      const response = await axios.get(`${API}/system-info`);
+      setSystemInfo(response.data);
+    } catch (error) {
+      console.error('Failed to fetch system info:', error);
+    }
+  };
 
   const fetchAnalyses = async () => {
     try {
