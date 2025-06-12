@@ -107,56 +107,138 @@ class HandbrakeJob(BaseModel):
 def analyze_video_with_ffmpeg(file_path: str) -> Dict[str, Any]:
     """Analyze video file using FFmpeg and return comprehensive metadata"""
     try:
-        # Use ffprobe to get video information
-        probe = ffmpeg.probe(file_path)
+        logger.info(f"Starting FFmpeg analysis for: {file_path}")
+        
+        # Verify file exists and is readable
+        if not Path(file_path).exists():
+            raise HTTPException(status_code=400, detail="File not found")
+        
+        file_size = Path(file_path).stat().st_size
+        if file_size == 0:
+            raise HTTPException(status_code=400, detail="File is empty")
+        
+        # Use ffprobe to get video information with enhanced options for MKV
+        try:
+            probe = ffmpeg.probe(
+                file_path,
+                cmd='ffprobe',
+                **{
+                    'v': 'quiet',
+                    'print_format': 'json',
+                    'show_format': None,
+                    'show_streams': None,
+                    'analyzeduration': '100M',  # Analyze more data for better accuracy
+                    'probesize': '100M'         # Probe more data, especially important for MKV
+                }
+            )
+        except ffmpeg.Error as e:
+            logger.error(f"FFprobe failed for {file_path}: {e}")
+            # Try with basic probe as fallback
+            try:
+                probe = ffmpeg.probe(file_path)
+            except Exception as fallback_error:
+                logger.error(f"Fallback FFprobe also failed: {fallback_error}")
+                raise HTTPException(status_code=422, detail=f"Unable to analyze video file. This may not be a valid video file or it may be corrupted. FFmpeg error: {str(e)}")
+        
+        logger.info(f"FFprobe completed for: {file_path}")
         
         video_stream = None
         audio_stream = None
         
         # Find video and audio streams
-        for stream in probe['streams']:
-            if stream['codec_type'] == 'video' and video_stream is None:
+        streams = probe.get('streams', [])
+        if not streams:
+            raise HTTPException(status_code=422, detail="No streams found in video file")
+        
+        for stream in streams:
+            codec_type = stream.get('codec_type', '')
+            if codec_type == 'video' and video_stream is None:
                 video_stream = stream
-            elif stream['codec_type'] == 'audio' and audio_stream is None:
+            elif codec_type == 'audio' and audio_stream is None:
                 audio_stream = stream
         
         if not video_stream:
-            raise HTTPException(status_code=400, detail="No video stream found")
+            raise HTTPException(status_code=422, detail="No video stream found in file")
         
-        # Extract video information
-        width = int(video_stream.get('width', 0))
-        height = int(video_stream.get('height', 0))
-        duration = float(probe['format'].get('duration', 0))
-        file_size = int(probe['format'].get('size', 0))
+        logger.info(f"Found video stream with codec: {video_stream.get('codec_name', 'unknown')}")
+        if audio_stream:
+            logger.info(f"Found audio stream with codec: {audio_stream.get('codec_name', 'unknown')}")
         
-        # Calculate frame rate
+        # Extract video information with better error handling
+        try:
+            width = int(video_stream.get('width', 0))
+            height = int(video_stream.get('height', 0))
+        except (ValueError, TypeError):
+            logger.warning(f"Could not parse width/height for {file_path}")
+            width = height = 0
+        
+        try:
+            duration = float(probe['format'].get('duration', 0))
+        except (ValueError, TypeError, KeyError):
+            # Try to get duration from video stream
+            try:
+                duration = float(video_stream.get('duration', 0))
+            except (ValueError, TypeError):
+                logger.warning(f"Could not parse duration for {file_path}")
+                duration = 0
+        
+        # Calculate frame rate with better error handling
         frame_rate = None
         if 'r_frame_rate' in video_stream:
             try:
-                num, den = video_stream['r_frame_rate'].split('/')
-                frame_rate = float(num) / float(den) if float(den) != 0 else None
-            except:
-                frame_rate = None
+                r_frame_rate = video_stream['r_frame_rate']
+                if '/' in r_frame_rate:
+                    num, den = r_frame_rate.split('/')
+                    if float(den) != 0:
+                        frame_rate = float(num) / float(den)
+                else:
+                    frame_rate = float(r_frame_rate)
+            except (ValueError, ZeroDivisionError):
+                # Try avg_frame_rate as fallback
+                try:
+                    if 'avg_frame_rate' in video_stream:
+                        avg_rate = video_stream['avg_frame_rate']
+                        if '/' in avg_rate:
+                            num, den = avg_rate.split('/')
+                            if float(den) != 0:
+                                frame_rate = float(num) / float(den)
+                except (ValueError, ZeroDivisionError):
+                    logger.warning(f"Could not parse frame rate for {file_path}")
         
         # Calculate bitrates
         video_bitrate = None
         if 'bit_rate' in video_stream:
-            video_bitrate = int(video_stream['bit_rate'])
-        elif duration > 0:
-            # Estimate video bitrate
-            total_bitrate = (file_size * 8) / duration
-            video_bitrate = int(total_bitrate * 0.8)  # Assume 80% is video
+            try:
+                video_bitrate = int(video_stream['bit_rate'])
+            except (ValueError, TypeError):
+                pass
+        
+        # If no video bitrate, estimate from file size and duration
+        if video_bitrate is None and duration > 0:
+            try:
+                total_bitrate = (file_size * 8) / duration
+                video_bitrate = int(total_bitrate * 0.8)  # Assume 80% is video
+            except:
+                pass
         
         audio_bitrate = None
         if audio_stream and 'bit_rate' in audio_stream:
-            audio_bitrate = int(audio_stream['bit_rate'])
+            try:
+                audio_bitrate = int(audio_stream['bit_rate'])
+            except (ValueError, TypeError):
+                pass
         
+        # Get container format
+        format_info = probe.get('format', {})
+        container_format = format_info.get('format_name', 'unknown')
+        
+        # Build analysis result
         analysis = {
             'filename': Path(file_path).name,
             'file_path': file_path,
             'file_size': file_size,
             'duration': duration,
-            'resolution': f"{width}x{height}",
+            'resolution': f"{width}x{height}" if width and height else "unknown",
             'width': width,
             'height': height,
             'video_codec': video_stream.get('codec_name', 'unknown'),
@@ -165,13 +247,16 @@ def analyze_video_with_ffmpeg(file_path: str) -> Dict[str, Any]:
             'audio_bitrate': audio_bitrate,
             'frame_rate': frame_rate,
             'aspect_ratio': video_stream.get('display_aspect_ratio', 'unknown'),
-            'container_format': probe['format'].get('format_name', 'unknown')
+            'container_format': container_format
         }
         
+        logger.info(f"Analysis completed for {file_path}: {width}x{height}, {video_stream.get('codec_name')}, {container_format}")
         return analysis
         
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error analyzing video {file_path}: {str(e)}")
+        logger.error(f"Unexpected error analyzing video {file_path}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Video analysis failed: {str(e)}")
 
 def generate_handbrake_settings(analysis: VideoAnalysis) -> HandbrakeSettings:
