@@ -13,8 +13,33 @@ const VideoUpload = ({ onUploadSuccess }) => {
   const [uploadStatus, setUploadStatus] = useState('');
 
   const handleFileUpload = async (file) => {
-    if (!file || !file.type.startsWith('video/')) {
-      alert('Please select a valid video file');
+    // Enhanced file validation for MKV and other video formats
+    const isValidVideoFile = (file) => {
+      const validExtensions = ['.mp4', '.avi', '.mkv', '.mov', '.webm', '.flv', '.wmv', '.m4v', '.mpg', '.mpeg', '.ts', '.mts'];
+      const validMimeTypes = [
+        'video/mp4', 'video/avi', 'video/x-msvideo', 'video/quicktime', 
+        'video/webm', 'video/x-flv', 'video/x-ms-wmv', 'video/x-m4v',
+        'video/x-matroska', 'video/mkv', 'application/x-matroska',
+        'video/mpeg', 'video/x-mpeg', 'video/mp2t'
+      ];
+      
+      // Check file extension
+      const fileName = file.name.toLowerCase();
+      const hasValidExtension = validExtensions.some(ext => fileName.endsWith(ext));
+      
+      // Check MIME type (if available)
+      const hasValidMimeType = file.type && (
+        file.type.startsWith('video/') || 
+        validMimeTypes.includes(file.type) ||
+        file.type === 'application/x-matroska' // Common MKV MIME type
+      );
+      
+      // Accept if either extension or MIME type is valid
+      return hasValidExtension || hasValidMimeType;
+    };
+
+    if (!file || !isValidVideoFile(file)) {
+      alert(`Please select a valid video file. Supported formats: MP4, AVI, MKV, MOV, WebM, FLV, WMV, M4V\n\nFile type detected: ${file.type || 'unknown'}\nFile name: ${file.name}`);
       return;
     }
 
@@ -57,13 +82,28 @@ const VideoUpload = ({ onUploadSuccess }) => {
       }, 1000);
     } catch (error) {
       console.error('Upload failed:', error);
-      if (error.code === 'ECONNABORTED') {
-        alert('Upload timed out. Please try with a smaller file or check your connection.');
-      } else if (error.response && error.response.status === 413) {
-        alert('File too large. Please try with a smaller file.');
+      let errorMessage = 'Failed to upload and analyze video. ';
+      
+      if (error.response) {
+        // Server responded with error
+        if (error.response.status === 413) {
+          errorMessage += 'File too large for server.';
+        } else if (error.response.status === 422) {
+          errorMessage += 'Invalid file format or corrupted file.';
+        } else if (error.response.status === 500) {
+          errorMessage += `Server error: ${error.response.data?.detail || 'Internal server error'}`;
+        } else {
+          errorMessage += `Server error (${error.response.status}): ${error.response.data?.detail || error.response.statusText}`;
+        }
+      } else if (error.code === 'ECONNABORTED') {
+        errorMessage += 'Upload timed out. Please try with a smaller file or check your connection.';
+      } else if (error.request) {
+        errorMessage += 'Network error. Please check your connection and try again.';
       } else {
-        alert('Failed to upload and analyze video. Please try again.');
+        errorMessage += `Unexpected error: ${error.message}`;
       }
+      
+      alert(errorMessage);
       setUploadStatus('Upload failed');
     } finally {
       setTimeout(() => {
