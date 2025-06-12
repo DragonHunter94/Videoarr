@@ -607,6 +607,16 @@ async def delete_analysis(analysis_id: str):
         logger.error(f"Error deleting analysis: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@api_router.get("/directory-configs", response_model=List[DirectoryConfig])
+async def get_directory_configs():
+    """Get all directory configurations"""
+    try:
+        configs = await db.directory_configs.find().to_list(100)
+        return [DirectoryConfig(**config) for config in configs]
+    except Exception as e:
+        logger.error(f"Error getting directory configs: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Include the router in the main app
 app.include_router(api_router)
 
