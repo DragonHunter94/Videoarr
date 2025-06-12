@@ -30,6 +30,11 @@ db = client[os.environ['DB_NAME']]
 # Create the main app without a prefix
 app = FastAPI(title="Video Optimization App", description="Analyze videos and optimize Handbrake settings")
 
+# Remove upload size limits for large video files
+app.router.route_class = type("LargeFileRoute", (app.router.route_class,), {
+    "get_request_handler": lambda self: lambda request: self.app(request.scope, request.receive, request.send)
+})
+
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
