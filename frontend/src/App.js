@@ -118,7 +118,20 @@ const VideoUpload = ({ onUploadSuccess }) => {
         {uploading ? (
           <div className="space-y-4">
             <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto"></div>
-            <p className="text-gray-600">Analyzing video...</p>
+            <div className="space-y-2">
+              <p className="text-gray-600">{uploadStatus}</p>
+              {uploadProgress > 0 && (
+                <div className="w-full bg-gray-200 rounded-full h-2">
+                  <div 
+                    className="bg-blue-600 h-2 rounded-full transition-all duration-300"
+                    style={{ width: `${uploadProgress}%` }}
+                  ></div>
+                </div>
+              )}
+              {uploadProgress > 0 && uploadProgress < 100 && (
+                <p className="text-sm text-gray-500">{uploadProgress}% uploaded</p>
+              )}
+            </div>
           </div>
         ) : (
           <div className="space-y-4">
