@@ -352,18 +352,30 @@ async def root():
     return {"message": "Video Optimization App API", "version": "1.0.0"}
 
 @api_router.post("/analyze-video", response_model=VideoAnalysis)
-async def analyze_video_file(file: UploadFile = File(...)):
-    """Upload and analyze a video file"""
+async def analyze_video_file(request: Request, file: UploadFile = File(...)):
+    """Upload and analyze a video file (supports files of any size)"""
     try:
         # Create temp directory for uploaded files
         temp_dir = Path("/tmp/video_uploads")
         temp_dir.mkdir(exist_ok=True)
         
-        # Save uploaded file
-        file_path = temp_dir / file.filename
+        # Generate unique filename to avoid conflicts
+        import time
+        timestamp = int(time.time())
+        safe_filename = f"{timestamp}_{file.filename}"
+        file_path = temp_dir / safe_filename
+        
+        # Save uploaded file with chunked reading for large files
+        logger.info(f"Starting upload of file: {file.filename}")
         async with aiofiles.open(file_path, 'wb') as f:
-            content = await file.read()
-            await f.write(content)
+            chunk_size = 8192 * 1024  # 8MB chunks for efficient large file handling
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                await f.write(chunk)
+        
+        logger.info(f"File upload completed: {file_path}, size: {file_path.stat().st_size} bytes")
         
         # Analyze video
         analysis_data = analyze_video_with_ffmpeg(str(file_path))
