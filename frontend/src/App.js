@@ -9,6 +9,8 @@ const API = `${BACKEND_URL}/api`;
 const VideoUpload = ({ onUploadSuccess }) => {
   const [uploading, setUploading] = useState(false);
   const [dragActive, setDragActive] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadStatus, setUploadStatus] = useState('');
 
   const handleFileUpload = async (file) => {
     if (!file || !file.type.startsWith('video/')) {
@@ -16,7 +18,19 @@ const VideoUpload = ({ onUploadSuccess }) => {
       return;
     }
 
+    // Check if file is very large and warn user
+    const fileSizeMB = file.size / (1024 * 1024);
+    if (fileSizeMB > 1000) {
+      const proceed = window.confirm(
+        `This is a large file (${fileSizeMB.toFixed(1)} MB). Upload and analysis may take several minutes. Continue?`
+      );
+      if (!proceed) return;
+    }
+
     setUploading(true);
+    setUploadProgress(0);
+    setUploadStatus(`Uploading ${file.name} (${fileSizeMB.toFixed(1)} MB)...`);
+
     try {
       const formData = new FormData();
       formData.append('file', file);
@@ -25,14 +39,38 @@ const VideoUpload = ({ onUploadSuccess }) => {
         headers: {
           'Content-Type': 'multipart/form-data',
         },
+        timeout: 0, // No timeout for large files
+        onUploadProgress: (progressEvent) => {
+          const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+          setUploadProgress(percentCompleted);
+          if (percentCompleted < 100) {
+            setUploadStatus(`Uploading... ${percentCompleted}%`);
+          } else {
+            setUploadStatus('Processing and analyzing video...');
+          }
+        },
       });
 
-      onUploadSuccess(response.data);
+      setUploadStatus('Analysis completed!');
+      setTimeout(() => {
+        onUploadSuccess(response.data);
+      }, 1000);
     } catch (error) {
       console.error('Upload failed:', error);
-      alert('Failed to upload and analyze video. Please try again.');
+      if (error.code === 'ECONNABORTED') {
+        alert('Upload timed out. Please try with a smaller file or check your connection.');
+      } else if (error.response && error.response.status === 413) {
+        alert('File too large. Please try with a smaller file.');
+      } else {
+        alert('Failed to upload and analyze video. Please try again.');
+      }
+      setUploadStatus('Upload failed');
     } finally {
-      setUploading(false);
+      setTimeout(() => {
+        setUploading(false);
+        setUploadProgress(0);
+        setUploadStatus('');
+      }, 2000);
     }
   };
 
