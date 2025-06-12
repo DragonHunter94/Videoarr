@@ -155,7 +155,8 @@ const VideoUpload = ({ onUploadSuccess }) => {
               </label>
             </div>
             <p className="text-sm text-gray-500">
-              Supports MP4, AVI, MKV, MOV, and other common video formats
+              Supports MP4, AVI, MKV, MOV, and other common video formats<br/>
+              <strong>No file size limit</strong> - Upload files of any size (GB+ supported)
             </p>
           </div>
         )}
