@@ -505,14 +505,106 @@ async def create_directory_config(config: DirectoryConfigCreate):
         logger.error(f"Error creating directory config: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@api_router.get("/directory-configs", response_model=List[DirectoryConfig])
-async def get_directory_configs():
-    """Get all directory configurations"""
+@api_router.get("/system-info")
+async def get_system_info():
+    """Get system information including disk space and upload capabilities"""
     try:
-        configs = await db.directory_configs.find().to_list(100)
-        return [DirectoryConfig(**config) for config in configs]
+        import shutil
+        import psutil
+        
+        # Get disk space
+        disk_usage = shutil.disk_usage("/tmp")
+        
+        # Get memory info
+        memory = psutil.virtual_memory()
+        
+        # Check ffmpeg and handbrake availability
+        ffmpeg_available = shutil.which("ffmpeg") is not None
+        handbrake_available = shutil.which("HandBrakeCLI") is not None
+        
+        return {
+            "upload_limits": {
+                "max_file_size": "unlimited",
+                "supported_formats": ["mp4", "avi", "mkv", "mov", "webm", "flv", "wmv", "m4v"],
+                "chunk_size": "8MB"
+            },
+            "disk_space": {
+                "total_gb": round(disk_usage.total / (1024**3), 2),
+                "free_gb": round(disk_usage.free / (1024**3), 2),
+                "used_gb": round((disk_usage.total - disk_usage.free) / (1024**3), 2)
+            },
+            "system": {
+                "memory_total_gb": round(memory.total / (1024**3), 2),
+                "memory_available_gb": round(memory.available / (1024**3), 2),
+                "cpu_count": psutil.cpu_count()
+            },
+            "tools": {
+                "ffmpeg_available": ffmpeg_available,
+                "handbrake_available": handbrake_available
+            }
+        }
     except Exception as e:
-        logger.error(f"Error getting directory configs: {str(e)}")
+        logger.error(f"Error getting system info: {str(e)}")
+        return {"error": str(e)}
+
+@api_router.post("/cleanup-temp")
+async def cleanup_temp_files():
+    """Clean up old temporary files"""
+    try:
+        temp_dir = Path("/tmp/video_uploads")
+        if not temp_dir.exists():
+            return {"message": "No temp directory found"}
+        
+        import time
+        current_time = time.time()
+        one_hour_ago = current_time - 3600  # 1 hour
+        
+        cleaned_files = 0
+        cleaned_size = 0
+        
+        for file_path in temp_dir.glob("*"):
+            if file_path.is_file():
+                file_mtime = file_path.stat().st_mtime
+                if file_mtime < one_hour_ago:
+                    file_size = file_path.stat().st_size
+                    file_path.unlink()
+                    cleaned_files += 1
+                    cleaned_size += file_size
+        
+        return {
+            "message": f"Cleaned {cleaned_files} files",
+            "files_cleaned": cleaned_files,
+            "space_freed_mb": round(cleaned_size / (1024 * 1024), 2)
+        }
+    except Exception as e:
+        logger.error(f"Error cleaning temp files: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.delete("/analysis/{analysis_id}")
+async def delete_analysis(analysis_id: str):
+    """Delete a video analysis and its associated files"""
+    try:
+        # Get analysis
+        analysis_doc = await db.video_analyses.find_one({"id": analysis_id})
+        if not analysis_doc:
+            raise HTTPException(status_code=404, detail="Analysis not found")
+        
+        analysis = VideoAnalysis(**analysis_doc)
+        
+        # Delete associated files if they exist
+        if Path(analysis.file_path).exists():
+            Path(analysis.file_path).unlink()
+        
+        # Delete from database
+        await db.video_analyses.delete_one({"id": analysis_id})
+        await db.handbrake_settings.delete_many({"video_analysis_id": analysis_id})
+        await db.handbrake_jobs.delete_many({"video_analysis_id": analysis_id})
+        
+        return {"message": "Analysis deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting analysis: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # Include the router in the main app
