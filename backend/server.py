@@ -501,6 +501,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Configure for large file uploads
+@app.middleware("http")
+async def large_file_middleware(request: Request, call_next):
+    """Middleware to handle large file uploads without size restrictions"""
+    # Remove any content-length restrictions for video uploads
+    if request.url.path.endswith("/analyze-video"):
+        # Allow unlimited content length for video analysis endpoint
+        request.state.max_content_length = None
+    
+    response = await call_next(request)
+    return response
+
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
