@@ -1,0 +1,120 @@
+version: '3.8'
+
+services:
+  # MongoDB Database
+  mongodb:
+    image: mongo:7.0
+    container_name: video-optimizer-db
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-securepassword123}
+      MONGO_INITDB_DATABASE: video_optimizer
+    volumes:
+      - mongodb_data:/data/db
+      - ./init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
+    ports:
+      - "${MONGO_PORT:-27017}:27017"
+    networks:
+      - video-optimizer-network
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # Backend API Service
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: video-optimizer-backend
+    restart: unless-stopped
+    environment:
+      MONGO_URL: mongodb://video_user:${MONGO_USER_PASSWORD:-userpassword123}@mongodb:27017/video_optimizer?authSource=video_optimizer
+      DB_NAME: video_optimizer
+      PYTHONUNBUFFERED: 1
+    volumes:
+      # Video input directory (mount your video directory here)
+      - ${VIDEO_INPUT_DIR:-./videos}:/app/videos:ro
+      # Processed video output directory
+      - ${VIDEO_OUTPUT_DIR:-./output}:/app/output
+      # Temporary upload directory
+      - video_uploads:/tmp/video_uploads
+      # HandBrake output directory
+      - handbrake_output:/tmp/handbrake_output
+    ports:
+      - "${BACKEND_PORT:-8001}:8001"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - video-optimizer-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/api/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Frontend Web Interface
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: video-optimizer-frontend
+    restart: unless-stopped
+    environment:
+      REACT_APP_BACKEND_URL: http://localhost:${BACKEND_PORT:-8001}
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - video-optimizer-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Nginx Reverse Proxy (Optional - for production)
+  nginx:
+    image: nginx:alpine
+    container_name: video-optimizer-proxy
+    restart: unless-stopped
+    ports:
+      - "${NGINX_PORT:-80}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - video-optimizer-network
+    profiles:
+      - production
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  mongodb_data:
+    driver: local
+  video_uploads:
+    driver: local
+  handbrake_output:
+    driver: local
+
+networks:
+  video-optimizer-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
