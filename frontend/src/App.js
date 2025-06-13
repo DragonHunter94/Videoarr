@@ -188,7 +188,7 @@ const VideoUpload = ({ onUploadSuccess }) => {
                 Browse Files
                 <input
                   type="file"
-                  accept="video/*"
+                  accept="video/*,.mkv,.mp4,.avi,.mov,.webm,.flv,.wmv,.m4v"
                   onChange={handleFileSelect}
                   className="hidden"
                 />
