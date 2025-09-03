@@ -1,790 +1,157 @@
-from fastapi import FastAPI, APIRouter, File, UploadFile, HTTPException, BackgroundTasks, Request
-from dotenv import load_dotenv
-from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
+import asyncio
 import os
-import logging
-from pathlib import Path
-from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
-import uuid
-from datetime import datetime
-import ffmpeg
+import shutil
 import subprocess
-import json
-import aiofiles
-import tempfile
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks, status
+from pydantic import BaseModel, Field
+from motor.motor_asyncio import AsyncIOMotorClient
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-import threading
-import psutil
 
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+# --- Environment Variables ---
+from dotenv import load_dotenv
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+load_dotenv()
 
-# Create the main app without a prefix
-app = FastAPI(title="Video Optimization App", description="Analyze videos and optimize Handbrake settings")
+MONGO_URL = os.getenv("MONGO_URL")
+DB_NAME = os.getenv("DB_NAME")
 
-# Remove upload size limits for large video files
-app.router.route_class = type("LargeFileRoute", (app.router.route_class,), {
-    "get_request_handler": lambda self: lambda request: self.app(request.scope, request.receive, request.send)
-})
+# --- Globals and Initialization ---
+mongo_client = AsyncIOMotorClient(MONGO_URL)
+db = mongo_client[DB_NAME]
 
-# Create a router with the /api prefix
-api_router = APIRouter(prefix="/api")
+temp_dir = Path("/tmp/video_processing_temp")
+temp_dir.mkdir(parents=True, exist_ok=True)
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# --- FastAPI App ---
+app = FastAPI(title="Video Optimizer Backend")
 
-# Models
-class VideoAnalysis(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    filename: str
-    file_path: str
-    file_size: int
-    duration: float
-    resolution: str
-    width: int
-    height: int
-    video_codec: str
-    audio_codec: str
-    video_bitrate: Optional[int] = None
-    audio_bitrate: Optional[int] = None
-    frame_rate: Optional[float] = None
-    aspect_ratio: str
-    container_format: str
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    analysis_status: str = "completed"
+# --- Directory Monitoring Queue and Handlers ---
+class VideoQueue:
+    def __init__(self):
+        self._queue = asyncio.Queue()
+        self._is_processing = False
 
-class HandbrakeSettings(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    video_analysis_id: str
-    preset: str
-    video_encoder: str
-    quality: str
-    audio_encoder: str
-    container: str
-    estimated_compression: float
-    full_command: str
-    reasoning: str
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    async def add_job(self, video_path: str):
+        await self._queue.put(video_path)
+        if not self._is_processing:
+            asyncio.create_task(self.process_video_queue())
 
-class DirectoryConfig(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    path: str
-    monitor_enabled: bool = True
-    auto_analyze: bool = True
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-
-class DirectoryConfigCreate(BaseModel):
-    path: str
-    monitor_enabled: bool = True
-    auto_analyze: bool = True
-
-class HandbrakeJob(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    video_analysis_id: str
-    input_file: str
-    output_file: str
-    handbrake_settings_id: str
-    status: str = "queued"  # queued, running, completed, failed
-    progress: float = 0.0
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
-    error_message: Optional[str] = None
-
-# Video Analysis Functions
-def analyze_video_with_ffmpeg(file_path: str) -> Dict[str, Any]:
-    """Analyze video file using FFmpeg and return comprehensive metadata"""
-    try:
-        logger.info(f"Starting FFmpeg analysis for: {file_path}")
-        
-        # Verify file exists and is readable
-        if not Path(file_path).exists():
-            raise HTTPException(status_code=400, detail="File not found")
-        
-        file_size = Path(file_path).stat().st_size
-        if file_size == 0:
-            raise HTTPException(status_code=400, detail="File is empty")
-        
-        # Use ffprobe to get video information with enhanced options for MKV
+    async def process_video_queue(self):
+        self._is_processing = True
         try:
-            probe = ffmpeg.probe(
-                file_path,
-                cmd='ffprobe',
-                **{
-                    'v': 'quiet',
-                    'print_format': 'json',
-                    'show_format': None,
-                    'show_streams': None,
-                    'analyzeduration': '100M',  # Analyze more data for better accuracy
-                    'probesize': '100M'         # Probe more data, especially important for MKV
-                }
-            )
-        except ffmpeg.Error as e:
-            logger.error(f"FFprobe failed for {file_path}: {e}")
-            # Try with basic probe as fallback
-            try:
-                probe = ffmpeg.probe(file_path)
-            except Exception as fallback_error:
-                logger.error(f"Fallback FFprobe also failed: {fallback_error}")
-                raise HTTPException(status_code=422, detail=f"Unable to analyze video file. This may not be a valid video file or it may be corrupted. FFmpeg error: {str(e)}")
-        
-        logger.info(f"FFprobe completed for: {file_path}")
-        
-        video_stream = None
-        audio_stream = None
-        
-        # Find video and audio streams
-        streams = probe.get('streams', [])
-        if not streams:
-            raise HTTPException(status_code=422, detail="No streams found in video file")
-        
-        for stream in streams:
-            codec_type = stream.get('codec_type', '')
-            if codec_type == 'video' and video_stream is None:
-                video_stream = stream
-            elif codec_type == 'audio' and audio_stream is None:
-                audio_stream = stream
-        
-        if not video_stream:
-            raise HTTPException(status_code=422, detail="No video stream found in file")
-        
-        logger.info(f"Found video stream with codec: {video_stream.get('codec_name', 'unknown')}")
-        if audio_stream:
-            logger.info(f"Found audio stream with codec: {audio_stream.get('codec_name', 'unknown')}")
-        
-        # Extract video information with better error handling
-        try:
-            width = int(video_stream.get('width', 0))
-            height = int(video_stream.get('height', 0))
-        except (ValueError, TypeError):
-            logger.warning(f"Could not parse width/height for {file_path}")
-            width = height = 0
+            while not self._queue.empty():
+                video_path = await self._queue.get()
+                print(f"Starting job for: {video_path}")
+                await self.run_handbrake_job(Path(video_path))
+                self._queue.task_done()
+                print(f"Finished job for: {video_path}")
+        finally:
+            self._is_processing = False
+
+    async def run_handbrake_job(self, input_path: Path):
+        temp_path = temp_dir / input_path.name
         
         try:
-            duration = float(probe['format'].get('duration', 0))
-        except (ValueError, TypeError, KeyError):
-            # Try to get duration from video stream
-            try:
-                duration = float(video_stream.get('duration', 0))
-            except (ValueError, TypeError):
-                logger.warning(f"Could not parse duration for {file_path}")
-                duration = 0
-        
-        # Calculate frame rate with better error handling
-        frame_rate = None
-        if 'r_frame_rate' in video_stream:
-            try:
-                r_frame_rate = video_stream['r_frame_rate']
-                if '/' in r_frame_rate:
-                    num, den = r_frame_rate.split('/')
-                    if float(den) != 0:
-                        frame_rate = float(num) / float(den)
-                else:
-                    frame_rate = float(r_frame_rate)
-            except (ValueError, ZeroDivisionError):
-                # Try avg_frame_rate as fallback
-                try:
-                    if 'avg_frame_rate' in video_stream:
-                        avg_rate = video_stream['avg_frame_rate']
-                        if '/' in avg_rate:
-                            num, den = avg_rate.split('/')
-                            if float(den) != 0:
-                                frame_rate = float(num) / float(den)
-                except (ValueError, ZeroDivisionError):
-                    logger.warning(f"Could not parse frame rate for {file_path}")
-        
-        # Calculate bitrates
-        video_bitrate = None
-        if 'bit_rate' in video_stream:
-            try:
-                video_bitrate = int(video_stream['bit_rate'])
-            except (ValueError, TypeError):
-                pass
-        
-        # If no video bitrate, estimate from file size and duration
-        if video_bitrate is None and duration > 0:
-            try:
-                total_bitrate = (file_size * 8) / duration
-                video_bitrate = int(total_bitrate * 0.8)  # Assume 80% is video
-            except:
-                pass
-        
-        audio_bitrate = None
-        if audio_stream and 'bit_rate' in audio_stream:
-            try:
-                audio_bitrate = int(audio_stream['bit_rate'])
-            except (ValueError, TypeError):
-                pass
-        
-        # Get container format
-        format_info = probe.get('format', {})
-        container_format = format_info.get('format_name', 'unknown')
-        
-        # Build analysis result
-        analysis = {
-            'filename': Path(file_path).name,
-            'file_path': file_path,
-            'file_size': file_size,
-            'duration': duration,
-            'resolution': f"{width}x{height}" if width and height else "unknown",
-            'width': width,
-            'height': height,
-            'video_codec': video_stream.get('codec_name', 'unknown'),
-            'audio_codec': audio_stream.get('codec_name', 'unknown') if audio_stream else 'none',
-            'video_bitrate': video_bitrate,
-            'audio_bitrate': audio_bitrate,
-            'frame_rate': frame_rate,
-            'aspect_ratio': video_stream.get('display_aspect_ratio', 'unknown'),
-            'container_format': container_format
-        }
-        
-        logger.info(f"Analysis completed for {file_path}: {width}x{height}, {video_stream.get('codec_name')}, {container_format}")
-        return analysis
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error analyzing video {file_path}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Video analysis failed: {str(e)}")
+            # 1. Move the input file to a temporary location
+            shutil.move(str(input_path), str(temp_path))
 
-def generate_handbrake_settings(analysis: VideoAnalysis) -> HandbrakeSettings:
-    """Generate optimal Handbrake settings based on video analysis"""
-    try:
-        # Determine optimal settings based on resolution and content
-        width, height = analysis.width, analysis.height
-        file_size_mb = analysis.file_size / (1024 * 1024)
-        duration_minutes = analysis.duration / 60
-        
-        # Calculate current bitrate per pixel
-        pixels = width * height
-        current_bitrate_per_pixel = (analysis.video_bitrate or 0) / pixels if pixels > 0 else 0
-        
-        # Determine quality settings based on resolution
-        if height >= 2160:  # 4K
-            preset = "Very Slow"
-            quality = "20"
-            video_encoder = "x265"
-            estimated_compression = 0.4
-            reasoning = "4K content: Using x265 with CRF 20 for maximum compression while maintaining quality"
-        elif height >= 1080:  # 1080p
-            preset = "Slow"
-            quality = "22" if current_bitrate_per_pixel > 0.15 else "20"
-            video_encoder = "x264"
-            estimated_compression = 0.5
-            reasoning = "1080p content: Using x264 with balanced settings for good compression"
-        elif height >= 720:  # 720p
-            preset = "Medium"
-            quality = "23"
-            video_encoder = "x264"
-            estimated_compression = 0.6
-            reasoning = "720p content: Using medium preset for faster encoding"
-        else:  # SD content
-            preset = "Fast"
-            quality = "25"
-            video_encoder = "x264"
-            estimated_compression = 0.7
-            reasoning = "SD content: Using fast preset with higher CRF"
-        
-        # Audio settings
-        if analysis.audio_codec in ['aac', 'mp3']:
-            audio_encoder = "copy"
-        else:
-            audio_encoder = "aac"
-        
-        # Container format
-        container = "mp4"
-        
-        # Build HandBrake command
-        input_file = analysis.file_path
-        output_file = f"{Path(input_file).stem}_optimized.{container}"
-        
-        handbrake_cmd = [
-            "HandBrakeCLI",
-            "-i", input_file,
-            "-o", output_file,
-            "--preset", preset,
-            "--encoder", video_encoder,
-            "--quality", quality,
-            "--aencoder", audio_encoder,
-            "--format", container
-        ]
-        
-        # Add x265 specific options for better compression
-        if video_encoder == "x265":
-            handbrake_cmd.extend(["--encoder-preset", "medium"])
-        
-        full_command = " ".join(handbrake_cmd)
-        
-        settings = HandbrakeSettings(
-            video_analysis_id=analysis.id,
-            preset=preset,
-            video_encoder=video_encoder,
-            quality=quality,
-            audio_encoder=audio_encoder,
-            container=container,
-            estimated_compression=estimated_compression,
-            full_command=full_command,
-            reasoning=reasoning
-        )
-        
-        return settings
-        
-    except Exception as e:
-        logger.error(f"Error generating Handbrake settings: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Settings generation failed: {str(e)}")
-
-async def run_handbrake_job(job_id: str):
-    """Run Handbrake encoding job in background"""
-    try:
-        # Get job details
-        job_doc = await db.handbrake_jobs.find_one({"id": job_id})
-        if not job_doc:
-            logger.error(f"Job {job_id} not found")
-            return
-        
-        job = HandbrakeJob(**job_doc)
-        
-        # Update job status to running
-        await db.handbrake_jobs.update_one(
-            {"id": job_id},
-            {"$set": {"status": "running", "started_at": datetime.utcnow()}}
-        )
-        
-        # Get Handbrake settings
-        settings_doc = await db.handbrake_settings.find_one({"id": job.handbrake_settings_id})
-        if not settings_doc:
-            raise Exception("Handbrake settings not found")
-        
-        settings = HandbrakeSettings(**settings_doc)
-        
-        # Parse and execute Handbrake command
-        cmd_parts = settings.full_command.split()[1:]  # Remove 'HandBrakeCLI'
-        cmd = ["HandBrakeCLI"] + cmd_parts
-        
-        # Update output path to be in a proper output directory
-        output_dir = Path("/tmp/handbrake_output")
-        output_dir.mkdir(exist_ok=True)
-        
-        # Find -o flag and update output path
-        for i, part in enumerate(cmd):
-            if part == "-o" and i + 1 < len(cmd):
-                original_name = Path(cmd[i + 1]).name
-                cmd[i + 1] = str(output_dir / original_name)
-                break
-        
-        logger.info(f"Starting Handbrake job: {' '.join(cmd)}")
-        
-        # Run Handbrake
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True
-        )
-        
-        # Monitor progress (simplified - just wait for completion)
-        stdout, stderr = process.communicate()
-        
-        if process.returncode == 0:
-            # Job completed successfully
-            await db.handbrake_jobs.update_one(
-                {"id": job_id},
-                {"$set": {
-                    "status": "completed",
-                    "progress": 100.0,
-                    "completed_at": datetime.utcnow()
-                }}
-            )
-            logger.info(f"Handbrake job {job_id} completed successfully")
-        else:
-            # Job failed
-            await db.handbrake_jobs.update_one(
-                {"id": job_id},
-                {"$set": {
-                    "status": "failed",
-                    "error_message": stderr,
-                    "completed_at": datetime.utcnow()
-                }}
-            )
-            logger.error(f"Handbrake job {job_id} failed: {stderr}")
+            # 2. Get HandBrake settings (this is a placeholder)
+            # You would implement your logic to determine the best settings here
+            settings = await self.get_handbrake_settings()
             
-    except Exception as e:
-        logger.error(f"Error running Handbrake job {job_id}: {str(e)}")
-        await db.handbrake_jobs.update_one(
-            {"id": job_id},
-            {"$set": {
-                "status": "failed",
-                "error_message": str(e),
-                "completed_at": datetime.utcnow()
-            }}
-        )
+            # 3. Build the HandBrake command
+            output_path = input_path.parent / f"optimized_{input_path.name}"
+            command = [
+                "HandBrakeCLI",
+                "-i", str(temp_path),
+                "-o", str(output_path),
+                "--preset", settings.get("preset", "Fast 1080p30"),
+                "--all-audio",
+                "--all-subtitles",
+            ]
+            
+            # 4. Run the HandBrake process
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode == 0:
+                print(f"HandBrake job successful for {input_path.name}.")
+                # 5. On success, delete the temporary file
+                os.remove(str(temp_path))
+            else:
+                print(f"HandBrake job failed for {input_path.name}. Restoring original file.")
+                # 6. On failure, move the temp file back to the original location
+                shutil.move(str(temp_path), str(input_path))
+                print(f"Error: {stderr.decode()}")
 
-# API Routes
-@api_router.get("/")
-async def root():
-    return {"message": "Video Optimization App API", "version": "1.0.0"}
+        except Exception as e:
+            print(f"An error occurred during transcoding: {e}")
+            if temp_path.exists():
+                print(f"Restoring original file from temp: {temp_path}")
+                shutil.move(str(temp_path), str(input_path))
 
-@api_router.post("/test-upload")
-async def test_upload(file: UploadFile = File(...)):
-    """Test endpoint to verify file upload without analysis - useful for debugging"""
+    async def get_handbrake_settings(self):
+        # This is a placeholder for your logic to dynamically get settings
+        return {"preset": "Fast 1080p30"}
+
+video_queue = VideoQueue()
+
+class VideoFileHandler(FileSystemEventHandler):
+    def on_created(self, event):
+        if not event.is_directory and event.src_path.lower().endswith(('.mp4', '.mov', '.mkv')):
+            print(f"Detected new video file: {event.src_path}")
+            asyncio.run(video_queue.add_job(event.src_path))
+
+async def start_monitoring(directory: str):
+    path_to_monitor = Path(directory)
+    if not path_to_monitor.exists():
+        print(f"Directory not found: {directory}")
+        return
+
+    event_handler = VideoFileHandler()
+    observer = Observer()
+    observer.schedule(event_handler, path_to_monitor, recursive=False)
+    observer.start()
+    print(f"Started monitoring directory: {directory}")
     try:
-        # Create temp directory
-        temp_dir = Path("/tmp/video_uploads")
-        temp_dir.mkdir(exist_ok=True)
-        
-        # Generate unique filename
-        import time
-        timestamp = int(time.time())
-        safe_filename = f"test_{timestamp}_{file.filename}"
-        file_path = temp_dir / safe_filename
-        
-        # Basic file info
-        file_info = {
-            'original_filename': file.filename,
-            'content_type': file.content_type,
-            'file_size': 0
-        }
-        
-        # Save file
-        logger.info(f"Test upload started for: {file.filename}")
-        async with aiofiles.open(file_path, 'wb') as f:
-            chunk_size = 8192 * 1024  # 8MB chunks
-            total_size = 0
-            while True:
-                chunk = await file.read(chunk_size)
-                if not chunk:
-                    break
-                await f.write(chunk)
-                total_size += len(chunk)
-        
-        file_info['file_size'] = total_size
-        file_info['saved_path'] = str(file_path)
-        
-        # Test FFmpeg probe on the file
-        try:
-            probe_result = ffmpeg.probe(str(file_path))
-            file_info['ffmpeg_probe'] = 'success'
-            file_info['streams_found'] = len(probe_result.get('streams', []))
-            file_info['format_detected'] = probe_result.get('format', {}).get('format_name', 'unknown')
-        except Exception as probe_error:
-            file_info['ffmpeg_probe'] = 'failed'
-            file_info['probe_error'] = str(probe_error)
-        
-        # Clean up test file
-        if file_path.exists():
-            file_path.unlink()
-        
-        logger.info(f"Test upload completed for: {file.filename}")
-        return {
-            'message': 'Test upload successful',
-            'file_info': file_info
-        }
-        
-    except Exception as e:
-        logger.error(f"Test upload failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Test upload failed: {str(e)}")
+        while True:
+            await asyncio.sleep(1)
+    finally:
+        observer.stop()
+        observer.join()
 
-@api_router.post("/analyze-video", response_model=VideoAnalysis)
-async def analyze_video_file(request: Request, file: UploadFile = File(...)):
-    """Upload and analyze a video file (supports files of any size)"""
-    try:
-        # Create temp directory for uploaded files
-        temp_dir = Path("/tmp/video_uploads")
-        temp_dir.mkdir(exist_ok=True)
-        
-        # Generate unique filename to avoid conflicts
-        import time
-        timestamp = int(time.time())
-        safe_filename = f"{timestamp}_{file.filename}"
-        file_path = temp_dir / safe_filename
-        
-        # Log file information
-        logger.info(f"Starting upload of file: {file.filename}")
-        
-        # Save uploaded file with chunked reading for large files
-        total_size = 0
-        async with aiofiles.open(file_path, 'wb') as f:
-            chunk_size = 8192 * 1024  # 8MB chunks for efficient large file handling
-            while True:
-                try:
-                    chunk = await file.read(chunk_size)
-                    if not chunk:
-                        break
-                    await f.write(chunk)
-                    total_size += len(chunk)
-                    
-                    # Log progress for very large files
-                    if total_size % (100 * 1024 * 1024) == 0:  # Log every 100MB
-                        logger.info(f"Upload progress: {total_size / (1024 * 1024):.1f} MB uploaded")
-                        
-                except Exception as e:
-                    logger.error(f"Error during file upload: {str(e)}")
-                    # Clean up partial file
-                    if file_path.exists():
-                        file_path.unlink()
-                    raise HTTPException(status_code=400, detail=f"Upload failed: {str(e)}")
-        
-        final_size = file_path.stat().st_size
-        logger.info(f"File upload completed: {file_path}, final size: {final_size} bytes ({final_size / (1024 * 1024):.1f} MB)")
-        
-        # Verify file exists and has content
-        if not file_path.exists() or final_size == 0:
-            raise HTTPException(status_code=400, detail="File upload failed or file is empty")
-        
-        # Analyze video
-        logger.info(f"Starting video analysis for: {file.filename}")
-        analysis_data = analyze_video_with_ffmpeg(str(file_path))
-        analysis = VideoAnalysis(**analysis_data)
-        
-        # Save analysis to database
-        await db.video_analyses.insert_one(analysis.dict())
-        
-        # Generate Handbrake settings
-        logger.info(f"Generating Handbrake settings for: {file.filename}")
-        handbrake_settings = generate_handbrake_settings(analysis)
-        await db.handbrake_settings.insert_one(handbrake_settings.dict())
-        
-        logger.info(f"Successfully analyzed video: {file.filename}, analysis ID: {analysis.id}")
-        return analysis
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in analyze_video_file: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@api_router.get("/analyses", response_model=List[VideoAnalysis])
-async def get_video_analyses():
-    """Get all video analyses"""
-    try:
-        analyses = await db.video_analyses.find().sort("created_at", -1).to_list(100)
-        return [VideoAnalysis(**analysis) for analysis in analyses]
-    except Exception as e:
-        logger.error(f"Error getting analyses: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@api_router.get("/analysis/{analysis_id}/settings", response_model=HandbrakeSettings)
-async def get_handbrake_settings(analysis_id: str):
-    """Get Handbrake settings for a video analysis"""
-    try:
-        settings = await db.handbrake_settings.find_one({"video_analysis_id": analysis_id})
-        if not settings:
-            raise HTTPException(status_code=404, detail="Settings not found")
-        return HandbrakeSettings(**settings)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting settings: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@api_router.post("/queue-handbrake/{analysis_id}")
-async def queue_handbrake_job(analysis_id: str, background_tasks: BackgroundTasks):
-    """Queue a Handbrake encoding job"""
-    try:
-        # Get analysis
-        analysis_doc = await db.video_analyses.find_one({"id": analysis_id})
-        if not analysis_doc:
-            raise HTTPException(status_code=404, detail="Analysis not found")
-        
-        analysis = VideoAnalysis(**analysis_doc)
-        
-        # Get settings
-        settings_doc = await db.handbrake_settings.find_one({"video_analysis_id": analysis_id})
-        if not settings_doc:
-            raise HTTPException(status_code=404, detail="Settings not found")
-        
-        settings = HandbrakeSettings(**settings_doc)
-        
-        # Create job
-        job = HandbrakeJob(
-            video_analysis_id=analysis_id,
-            input_file=analysis.file_path,
-            output_file=f"{Path(analysis.file_path).stem}_optimized.mp4",
-            handbrake_settings_id=settings.id
-        )
-        
-        # Save job to database
-        await db.handbrake_jobs.insert_one(job.dict())
-        
-        # Queue background task
-        background_tasks.add_task(run_handbrake_job, job.id)
-        
-        return {"message": "Job queued successfully", "job_id": job.id}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error queuing job: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@api_router.get("/jobs", response_model=List[HandbrakeJob])
-async def get_handbrake_jobs():
-    """Get all Handbrake jobs"""
-    try:
-        jobs = await db.handbrake_jobs.find().sort("created_at", -1).to_list(100)
-        return [HandbrakeJob(**job) for job in jobs]
-    except Exception as e:
-        logger.error(f"Error getting jobs: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@api_router.post("/directory-config", response_model=DirectoryConfig)
-async def create_directory_config(config: DirectoryConfigCreate):
-    """Configure a directory for monitoring"""
-    try:
-        directory_config = DirectoryConfig(**config.dict())
-        await db.directory_configs.insert_one(directory_config.dict())
-        return directory_config
-    except Exception as e:
-        logger.error(f"Error creating directory config: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@api_router.get("/system-info")
-async def get_system_info():
-    """Get system information including disk space and upload capabilities"""
-    try:
-        import shutil
-        import psutil
-        
-        # Get disk space
-        disk_usage = shutil.disk_usage("/tmp")
-        
-        # Get memory info
-        memory = psutil.virtual_memory()
-        
-        # Check ffmpeg and handbrake availability
-        ffmpeg_available = shutil.which("ffmpeg") is not None
-        handbrake_available = shutil.which("HandBrakeCLI") is not None
-        
-        return {
-            "upload_limits": {
-                "max_file_size": "unlimited",
-                "supported_formats": ["mp4", "avi", "mkv", "mov", "webm", "flv", "wmv", "m4v"],
-                "chunk_size": "8MB"
-            },
-            "disk_space": {
-                "total_gb": round(disk_usage.total / (1024**3), 2),
-                "free_gb": round(disk_usage.free / (1024**3), 2),
-                "used_gb": round((disk_usage.total - disk_usage.free) / (1024**3), 2)
-            },
-            "system": {
-                "memory_total_gb": round(memory.total / (1024**3), 2),
-                "memory_available_gb": round(memory.available / (1024**3), 2),
-                "cpu_count": psutil.cpu_count()
-            },
-            "tools": {
-                "ffmpeg_available": ffmpeg_available,
-                "handbrake_available": handbrake_available
-            }
-        }
-    except Exception as e:
-        logger.error(f"Error getting system info: {str(e)}")
-        return {"error": str(e)}
-
-@api_router.post("/cleanup-temp")
-async def cleanup_temp_files():
-    """Clean up old temporary files"""
-    try:
-        temp_dir = Path("/tmp/video_uploads")
-        if not temp_dir.exists():
-            return {"message": "No temp directory found"}
-        
-        import time
-        current_time = time.time()
-        one_hour_ago = current_time - 3600  # 1 hour
-        
-        cleaned_files = 0
-        cleaned_size = 0
-        
-        for file_path in temp_dir.glob("*"):
-            if file_path.is_file():
-                file_mtime = file_path.stat().st_mtime
-                if file_mtime < one_hour_ago:
-                    file_size = file_path.stat().st_size
-                    file_path.unlink()
-                    cleaned_files += 1
-                    cleaned_size += file_size
-        
-        return {
-            "message": f"Cleaned {cleaned_files} files",
-            "files_cleaned": cleaned_files,
-            "space_freed_mb": round(cleaned_size / (1024 * 1024), 2)
-        }
-    except Exception as e:
-        logger.error(f"Error cleaning temp files: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@api_router.delete("/analysis/{analysis_id}")
-async def delete_analysis(analysis_id: str):
-    """Delete a video analysis and its associated files"""
-    try:
-        # Get analysis
-        analysis_doc = await db.video_analyses.find_one({"id": analysis_id})
-        if not analysis_doc:
-            raise HTTPException(status_code=404, detail="Analysis not found")
-        
-        analysis = VideoAnalysis(**analysis_doc)
-        
-        # Delete associated files if they exist
-        if Path(analysis.file_path).exists():
-            Path(analysis.file_path).unlink()
-        
-        # Delete from database
-        await db.video_analyses.delete_one({"id": analysis_id})
-        await db.handbrake_settings.delete_many({"video_analysis_id": analysis_id})
-        await db.handbrake_jobs.delete_many({"video_analysis_id": analysis_id})
-        
-        return {"message": "Analysis deleted successfully"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error deleting analysis: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@api_router.get("/directory-configs", response_model=List[DirectoryConfig])
-async def get_directory_configs():
-    """Get all directory configurations"""
-    try:
-        configs = await db.directory_configs.find().to_list(100)
-        return [DirectoryConfig(**config) for config in configs]
-    except Exception as e:
-        logger.error(f"Error getting directory configs: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Include the router in the main app
-app.include_router(api_router)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Configure for large file uploads
-@app.middleware("http")
-async def large_file_middleware(request: Request, call_next):
-    """Middleware to handle large file uploads without size restrictions"""
-    # Remove any content-length restrictions for video uploads
-    if request.url.path.endswith("/analyze-video"):
-        # Allow unlimited content length for video analysis endpoint
-        request.state.max_content_length = None
+@app.on_event("startup")
+async def startup_db_client():
+    # You would typically load the list of directories to monitor from the database here
+    monitored_dirs = ["/path/to/your/video/folder"]
     
-    response = await call_next(request)
-    return response
+    for directory in monitored_dirs:
+        # Start a new task to monitor each directory
+        asyncio.create_task(start_monitoring(directory))
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    mongo_client.close()
+    
+# --- Pydantic Models for API ---
+class Directory(BaseModel):
+    path: str = Field(..., description="The path of the directory to monitor.")
+
+# --- API Endpoints ---
+@app.get("/")
+async def read_root():
+    return {"message": "Video Optimizer is running"}
+
+@app.post("/monitor_directory", status_code=status.HTTP_202_ACCEPTED)
+async def monitor_directory(directory: Directory):
+    # In a real-world app, you'd save this path to the database
+    # for persistence across restarts and trigger the monitoring task
+    asyncio.create_task(start_monitoring(directory.path))
+    return {"message": f"Monitoring of directory '{directory.path}' has been initiated."}
